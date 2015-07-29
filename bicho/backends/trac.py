@@ -3,6 +3,9 @@ import base64
 import time
 from datetime import datetime
 import re
+from bs4 import BeautifulSoup
+import urllib2
+
 
 from storm.locals import Int, DateTime, Unicode, Reference, Desc
 
@@ -12,13 +15,12 @@ from bicho.db.database import DBIssue, DBBackend, DBTracker, get_database
 from bicho.common import Tracker, Issue, People, Change, Attachment, Comment
 from bicho.utils import create_dir, printdbg, printout, printerr
 
-
-import urllib2
 import json
 import HTMLParser
-from BeautifulSoup import BeautifulSoup
 
+from pprint import pprint
 
+TIMEFORMAT="%b %d, %Y %I:%M:%S %p"
 
 class DBTracIssueExt(object):
     """
@@ -28,12 +30,12 @@ class DBTracIssueExt(object):
     id = Int(primary=True)
     cc = Unicode()
     keywords = Unicode()
-    keywords = Unicode()
     version = Unicode()
     component = Unicode()
     milestone = Unicode()
     priority = Unicode()
     status = Unicode()
+    severity = Unicode()
     modified_at = DateTime()
     closed_at = DateTime()
 
@@ -61,6 +63,7 @@ class DBTracIssueExtMySQL(DBTracIssueExt):
                      keywords VARCHAR(256) NOT NULL, \
                      version VARCHAR(32) NOT NULL, \
                      component VARCHAR(32) NOT NULL, \
+                     severity VARCHAR(32) NOT NULL, \
                      milestone VARCHAR(32) NOT NULL, \
                      priority VARCHAR(32) NOT NULL, \
                      cc VARCHAR(100) NOT NULL, \
@@ -86,7 +89,6 @@ class DBTracBackend(DBBackend):
         """
         """
         newissue = False
-        printdbg("This is not a new issue")
         try:
 
             db_issue_ext = store.find(DBTracIssueExt, DBTracIssueExt.issue_id == issue_id).one()
@@ -102,6 +104,7 @@ class DBTracBackend(DBBackend):
             db_issue_ext.milestone = self.__return_unicode(issue.milestone)
             db_issue_ext.priority = self.__return_unicode(issue.priority)
             db_issue_ext.status = self.__return_unicode(issue.status)
+            db_issue_ext.severity = self.__return_unicode(issue.severity)
             db_issue_ext.version = self.__return_unicode(issue.version)
             db_issue_ext.modified_at = issue.modified_at
             db_issue_ext.closed_at = issue.closed_at
@@ -161,6 +164,7 @@ class TracIssue(Issue):
         self.status = None
         self.modified_at = None
         self.closed_at = None
+        self.severity = None
 
     def setComponent(self,component):
         self.component = component
@@ -192,6 +196,9 @@ class TracIssue(Issue):
     def set_closed_at(self, closed_at):
         self.closed_at = closed_at
 
+    def set_severity(self, severity):
+        self.severity = severity
+
 
 class TracBackend(Backend):
 
@@ -201,12 +208,26 @@ class TracBackend(Backend):
         # self.url = 'http://trac.plumi.org/'
         # self.url = 'http://10.137.2.15:8000/test/'
         self.delay = 3.0
+        self.start_from = 0
+        self.end_with = None
 
     def choose_what_to_analyze(self, arg1, arg2):
         """Dispatch method"""
         method_name = 'analyze_' + str(arg1)
         method = getattr(self, method_name)
         return method(arg2)
+
+    def __get_time(self, arg):
+        tempdate = re.search("See timeline at\s(.*)\">", str(arg))
+        td = datetime.strptime(tempdate.group(1), TIMEFORMAT)
+
+        return td
+
+    def __get_submitter(self,arg):
+        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg)).group(1).decode('UTF-8')
+        by = People(bytemp)
+
+        return by
 
     def analyze_milestone(self, arg2):
 
@@ -215,15 +236,11 @@ class TracBackend(Backend):
         """
 
         printdbg("We're analyzing milestones")
+        # Get the time-date of submission
+        td = self.__get_time(arg2)
 
-        # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
-
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
-        # print "analyzing {}".format(arg2)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         mr = re.search('\s+<em>(.*)</em>\s(?=deleted)', str(arg2))
         mc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
@@ -254,12 +271,10 @@ class TracBackend(Backend):
 
         printdbg("We're analyzing keywords")
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # We check which form of keywords modification we have
         # possible cases are
@@ -298,12 +313,10 @@ class TracBackend(Backend):
 
         printdbg("We're analyzing statuses")
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", arg2)
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # The pattern that we look for is:
         # changed from <em><status1></em> to <em><status2></em>
@@ -324,20 +337,23 @@ class TracBackend(Backend):
 
         printdbg("We're analyzing owners")
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", arg2)
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # The pattern that we look for is:
         # changed from <em><status1></em> to <em><status2></em>
-        st = re.search('changed\sfrom\s<em>(.*)</em>\sto\s<em>(.*)</em>', arg2)
+        os = re.search('set\sto\s<em>(.*)</em>', arg2)
+        oc = re.search('changed\sfrom\s<em>(.*)</em>\sto\s<em>(.*)</em>', arg2)
 
-        if st is not None:
-            removed = st.group(1).decode('UTF-8')
-            added = st.group(2).decode('UTF-8')
+        if os is not None:
+            removed = u''
+            added = os.group(1).decode('UTF-8')
+            printdbg("removed: {}, added: {}".format(removed, added))
+        elif oc is not None:
+            removed = oc.group(1).decode('UTF-8')
+            added = oc.group(2).decode('UTF-8')
             printdbg("removed: {}, added: {}".format(removed, added))
         else:
             printdbg("Status unknown case. Error ?")
@@ -345,17 +361,43 @@ class TracBackend(Backend):
         ch = Change(u'owner', removed, added, by, td)
         return ch
 
+    def analyze_severity(self, arg2):
+
+        printdbg("We're analyzing severity")
+        # Get the time-date of the event
+        td = self.__get_time(arg2)
+
+        # Get the submitter
+        by = self.__get_submitter(arg2)
+
+        # The pattern that we look for is:
+        # changed from <em><status1></em> to <em><status2></em>
+        ss = re.search('set\sto\s<em>(.*)</em>', arg2)
+        sc = re.search('changed\sfrom\s<em>(.*)</em>\sto\s<em>(.*)</em>', arg2)
+
+        if ss is not None:
+            removed = u''
+            added = ss.group(1).decode('UTF-8')
+            printdbg("removed: {}, added: {}".format(removed, added))
+        elif sc is not None:
+            removed = sc.group(1).decode('UTF-8')
+            added = sc.group(2).decode('UTF-8')
+            printdbg("removed: {}, added: {}".format(removed, added))
+        else:
+            printdbg("Status unknown case. Error ?")
+
+        ch = Change(u'severity', removed, added, by, td)
+        return ch
+
+
     def analyze_version(self, arg2):
         printdbg("We're analyzing version")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", arg2)
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
-        # print "analyzing {}".format(arg2)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         vr = re.search('\s+<em>(.*)</em>\s(?=deleted)', arg2)
         vc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', arg2)
@@ -383,12 +425,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing resolution")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         rr = re.search('\s+<em>(.*)</em>\s(?=deleted)', str(arg2))
         rs = re.search('(?<=\sset\sto\s)<em>(.*)</em>', str(arg2))
@@ -411,12 +451,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing component")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         cc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
 
@@ -434,12 +472,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing priority")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         cc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
 
@@ -456,12 +492,10 @@ class TracBackend(Backend):
 
         printdbg("We're analyzing cc")
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # We check which form of keywords modification we have
         # possible cases are
@@ -491,12 +525,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing type")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", str(arg2)).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         tc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
 
@@ -513,12 +545,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing summary")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         sc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
 
@@ -532,16 +562,35 @@ class TracBackend(Backend):
         ch = Change(u'summary', removed, added, by, td)
         return ch
 
+    def analyze_reporter(self, arg2):
+        printdbg("We're analyzing reporter")
+
+        # Get the time-date of the event
+        td = self.__get_time(arg2)
+
+        # Get the submitter
+        by = self.__get_submitter(arg2)
+
+        rc = re.search('(?<=\schanged\sfrom\s)<em>(.*)</em>\sto\s<em>(.*)</em>\s', str(arg2))
+
+        if rc is not None:
+            removed = rc.group(1).decode('UTF-8')
+            added = rc.group(2).decode('UTF-8')
+        else:
+            printdbg("summary unknown case. Error ?")
+
+        #printdbg("removed: {}, add: {}".format(removed, added))
+        ch = Change(u'submitted_by', removed, added, by, td)
+        return ch
+
     def analyze_attachment(self, arg2):
         printdbg("We're analyzing attachment")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # The comment of the file inbetween <p> tags
         ac = re.search('(?<=\s<div class="comment searchable">)\s+<p>\s+(\w.*)\s</p>\s+</div>', str(arg2))
@@ -553,7 +602,6 @@ class TracBackend(Backend):
             comment = ac.group(1).decode('UTF-8')
         else:
             comment = u''
-            printdbg("Comment not found, error?")
 
         if anu is not None:
             name = anu.group(1).decode('UTF-8')
@@ -576,12 +624,10 @@ class TracBackend(Backend):
         printdbg("We're analyzing comment")
 
         # Get the time-date of the event
-        tempdate = re.search("See timeline at\s(.*)\">", str(arg2))
-        td = datetime.strptime(tempdate.group(1), "%b %d, %Y %I:%M:%S %p")
+        td = self.__get_time(arg2)
 
-        # Get the author of the event
-        bytemp = re.search("Changed\s.*\sby\s(.*)", arg2).group(1).decode('UTF-8')
-        by = People(bytemp)
+        # Get the submitter
+        by = self.__get_submitter(arg2)
 
         # The comment of the file inbetween <div class="comment searchable" tags
         cf = re.search('<div class="comment searchable">(.*)</div>\s+</div>', arg2, re.S)
@@ -607,7 +653,6 @@ class TracBackend(Backend):
         bs = BeautifulSoup(result)
 
         numresults = bs.find('span',{'class': 'numrows'}).getText().strip('()')[:-8]
-        # numresults=int(numresults)
         numpages = int(numresults) / 100 + 1
 
         for page in range(numpages):
@@ -616,7 +661,7 @@ class TracBackend(Backend):
 
             bs = BeautifulSoup(get_indexes)
             for tmp in bs.findAll('td', {'class': 'ticket'}):
-                issue_index.append(tmp.getText().strip('# '))
+                issue_index.append(tmp.getText().strip('\n').strip('# '))
 
         if not issue_index:
             raise ValueError('Bug list is empty. Did you provide a correct url?')
@@ -626,33 +671,35 @@ class TracBackend(Backend):
     def getIssue(self, url, id):
         issue = url + "ticket/" + id
         result = urllib2.urlopen(issue).read()
+
         return result
 
     def analyzeBug(self, raw_data):
 
-        myTmpDates = []
-
+        properties = {}
         bs = BeautifulSoup(raw_data)
 
-        props = bs.find('table', {'class': 'properties'})
-        myStatus = bs.find('span', {'class': 'trac-status'}).getText().strip()
-        myId = bs.find('a', {'class': 'trac-id'}).getText().strip()
-        myType = bs.find('span', {'class': 'trac-type'}).getText().strip()
-        mySummary = bs.find('span', {'class': 'summary'}).getText().strip()
+        #  etting the status of the issue
+        myStatus = bs.find('span', {'class': 'trac-status'}).getText().strip().decode('UTF-8')
 
-        # TODO: Ameliorer cette condition. <div> searchable se trouve dans un <div> description
+        # Gettint the ID of the issue
+        myId = bs.find('a', {'class': 'trac-id'}).getText().strip()
+
+        # Getting the type of the issue (bug, enhancement, ...)
+        myType = bs.find('span', {'class': 'trac-type'}).getText().strip().decode('UTF-8')
+
+        # Getting the summary of the issue
+        mySummary = bs.find('span', {'class': 'summary'}).getText().strip().decode('UTF-8')
+
+        # Getting the description of the issue (optional)
+        # TODO: Improve this condition.
         myTmpDesc = bs.find('div', {'class': 'searchable'})
         if myTmpDesc is not None:
             myDescription = myTmpDesc.getText().strip()
         else:
-            myDescription = 'None'
+            myDescription = u'None'
 
-        myTmpDatetime = bs.findAll('a', {'class': 'timeline'})#.get('title')[16:]
-        # myTmpDatetime = bs.find('div', {'class': 'date'}).getTitle().strip()
-        for each in myTmpDatetime:
-            myTmpDates.append(each.get('title')[16:])
-
-        # TODO: Treat the case of a closed bug (3 dates)
+        # We get the time and date of submission. last modification and closing (last two are optional)
         dates = bs.find('div', {'class': 'date'})
         if dates is not None:
             opened_t = re.search('<p>Opened.*title="See timeline at\s(.*)">.*</p>', str(dates))
@@ -660,36 +707,47 @@ class TracBackend(Backend):
             modified_t = re.search('<p>Last modified.*title="See timeline at\s(.*)">.*</p>', str(dates))
 
         if opened_t is not None:
-            opened_at = datetime.strptime(opened_t.group(1), "%b %d, %Y %I:%M:%S %p")
+            opened_at = datetime.strptime(opened_t.group(1), TIMEFORMAT)
         else:
             # This shoud never happen
             # TODO: raise error if we enter this case
             opened_at = None
 
         if closed_t is not None:
-            closed_at = datetime.strptime(closed_t.group(1), "%b %d, %Y %I:%M:%S %p")
+            closed_at = datetime.strptime(closed_t.group(1), TIMEFORMAT)
         else:
             # Ticket is not yet closed
             closed_at = None
 
         if modified_t is not None:
-            modified_at = datetime.strptime(modified_t.group(1), "%b %d, %Y %I:%M:%S %p")
+            modified_at = datetime.strptime(modified_t.group(1), TIMEFORMAT)
         else:
             # Ticket is not yet modified
             modified_at = None
 
-        properties = [s.getText().strip() for s in props.findAll('td')]
+        # Getting the other properties. They are placed in a table called 'properties'.
+        props = bs.find('table', {'class': 'properties'})
+        for s in props.find_all('td'):
 
-        # Paul: est-ce que c'est une bonne methode de passer par une variable intermediaire ?
-        mySubmitter = People(properties[0])
-        # printdbg(mySubmitter.user_id)
-        myAssignedTo = People(properties[1])
-        myPriority = properties[2]
-        myMilestone = properties[3]
-        myComponent = properties[4]
-        myVersion = properties[5]
-        myKeywords = properties[6]
-        myCC = properties[7]
+            # In old version of Trac we have empty <td> fields with no headers="h_something" if class="missing"
+            # In recent version headers is kept even if the class is 'missing'
+            # We need to do this check to be sure that we are not looking for non-existing element
+
+            if s.has_key('headers'):
+                p = s['headers'][0]
+            else:
+                p = u'Unknown'
+            # printdbg(p)
+            properties[p] = s.get_text().strip('\n')
+
+        mySubmitter = People(unicode(properties['h_reporter']))
+        myAssignedTo = People(unicode(properties['h_owner']))
+        myPriority = unicode(properties['h_priority'])
+        myMilestone = unicode(properties['h_milestone'])  # Eventually missing
+        myComponent = unicode(properties['h_component'])
+        myVersion = unicode(properties['h_version'])
+        myKeywords = unicode(properties['h_keywords'])
+        myCC = unicode(properties['h_cc'])
 
         issue = TracIssue(myId, myType, mySummary, myDescription, mySubmitter, opened_at)
 
@@ -747,11 +805,8 @@ class TracBackend(Backend):
 
             else:
                 printdbg("This is a comment")
-                # h3 = re.search('<h3 class="change">.*</h3>', change, re.S)
                 cmt = self.choose_what_to_analyze('comment', change)
                 issue.add_comment(cmt)
-
-                # issue add changes, comments and attachments depending on val.__class__
 
         return issue
 
@@ -765,9 +820,11 @@ class TracBackend(Backend):
         cfg = Config()
         cfg.load_from_file("/home/user/Grimoire/Bicho/bicho/bicho.conf")
 
-        # url = "http://10.137.2.15:8000/test/"
-        url = 'http://software.rtcm-ntrip.org/'
-        #project = "http://trac.nginx.org/nginx/"
+        # url = 'http://10.137.2.15:8000/test/'
+        # url = 'http://dev.aubio.org/'
+        url = 'http://trac.nginx.org/nginx/'
+        # url = 'http://software.rtcm-ntrip.org/'
+        # project = "http://trac.nginx.org/nginx/"
         # issues = TracIssue
         tibi = TracBackend()
         issues = tibi.getIDs(url)
@@ -777,26 +834,33 @@ class TracBackend(Backend):
         trk = Tracker(url, "trac", "1.0.6post2")
         dbtrk = bugsdb.insert_tracker(trk)
 
-        print type(issues)
-        for entry in issues:
+        self.start_from = 0 if self.start_from is None else self.start_from
+        self.end_with = len(issues) if self.end_with is None else self.end_with
 
-            if start_from is not None:
-                if issues.index(entry)
+        for i in range(len(issues)):
+            if i < self.start_from:
+                continue
+            elif i > self.end_with:
+                break
 
-            printdbg("We are trying issue: {}".format(entry))
+            printdbg("We are trying issue: {}".format(issues[i]))
             try:
                 printdbg("Getting the entry")
-                raw_data = tibi.getIssue(url, entry)
+
+                raw_data = tibi.getIssue(url, issues[i])
                 printdbg("Parsing the entry")
                 issue = tibi.analyzeBug(raw_data)
                 printdbg("Inserting the issue into the DB")
+
                 # Put an issue into the database.
+                # pprint(vars(issue))
                 bugsdb.insert_issue(issue, dbtrk.id)
 
-            except UnicodeEncodeError:
+            except UnicodeEncodeError, e:
                 printerr(
                     "UnicodeEncodeError: the issue %s couldn't be stored"
-                    % (issue_data.issue))
+                    % (issues[i]))
+                print e
 
             except Exception, e:
                 printerr("Error :")
